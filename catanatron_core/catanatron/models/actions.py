@@ -101,9 +101,10 @@ def generate_playable_actions(state) -> List[Action]:
 
         return actions
     elif action_prompt == ActionPrompt.DECIDE_ACCEPTEES:
-        # you should be able to accept for each of the "accepting players"
-        actions = [Action(color, ActionType.CANCEL_TRADE, None)]
+        # Create empty array of actions
+        actions = []
 
+        # you should be able to accept for each of the "accepting players"
         for other_color, accepted in zip(state.colors, state.acceptees):
             if accepted:
                 actions.append(
@@ -113,6 +114,11 @@ def generate_playable_actions(state) -> List[Action]:
                         (*state.current_trade[:10], other_color),
                     )
                 )
+
+        # Add cancel option if there aren't acceptees
+        if not actions:
+            actions = [Action(color, ActionType.CANCEL_TRADE, None)]
+
         return actions
     else:
         raise RuntimeError("Unknown ActionPrompt: " + str(action_prompt))

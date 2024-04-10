@@ -676,11 +676,15 @@ def apply_action(state: State, action: Action):
 
         state.current_player_index = state.current_turn_index
         state.current_prompt = ActionPrompt.PLAY_TURN
+
+        state.playable_actions = generate_playable_actions(state)
     elif action.action_type == ActionType.CANCEL_TRADE:
         reset_trading_state(state)
 
         state.current_player_index = state.current_turn_index
         state.current_prompt = ActionPrompt.PLAY_TURN
+
+        state.playable_actions = generate_playable_actions(state)
     else:
         raise ValueError("Unknown ActionType " + str(action.action_type))
 
