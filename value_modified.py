@@ -1,30 +1,19 @@
+from enum import Enum
 import random
+import numpy as np
 
-from catanatron.state_functions import (
-    get_longest_road_length,
-    get_played_dev_cards,
-    player_key,
-    player_num_dev_cards,
-    player_num_resource_cards,
-)
 from catanatron.models.player import Player
-from catanatron.models.enums import RESOURCES, SETTLEMENT, CITY
-from catanatron_gym.features import (
-    build_production_features,
-    reachability_features,
-    resource_hand_features,
-)
-
-from testPlayer import addTradeAction, TraderBotPlayer
+from catanatron.models.enums import RESOURCES
+from catanatron_experimental.cli.cli_players import register_player
+from catanatron_experimental.machine_learning.players.value import get_value_fn
 
 from catanatron.state_functions import (
+    get_enemy_colors,
     player_has_rolled,
-    player_key,
-    player_num_resource_cards,
-    player_resource_freqdeck_contains,
     player_freqdeck_add,
     player_freqdeck_subtract,
-    get_enemy_colors
+    player_num_resource_cards,
+    player_resource_freqdeck_contains,
 )
 
 from catanatron.models.enums import (
@@ -32,144 +21,304 @@ from catanatron.models.enums import (
     Action,
     ActionPrompt,
     ActionType,
-    BRICK,
-    ORE,
-    FastResource,
-    SETTLEMENT,
-    SHEEP,
-    WHEAT,
-    WOOD,
 )
 
-import numpy as np
+######################################################################
+# HELPER VARIABLES AND ENUMS
+######################################################################
 
-TRANSLATE_VARIETY = 4  # i.e. each new resource is like 4 production points
-
-DEFAULT_WEIGHTS = {
-    # Where to place. Note winning is best at all costs
-    "public_vps": 3e14,
-    "production": 1e8,
-    "enemy_production": -1e8,
-    "num_tiles": 1,
-    # Towards where to expand and when
-    "reachable_production_0": 0,
-    "reachable_production_1": 1e4,
-    "buildable_nodes": 1e3,
-    "longest_road": 10,
-    # Hand, when to hold and when to use.
-    "hand_synergy": 1e2,
-    "hand_resources": 1,
-    "discard_penalty": -5,
-    "hand_devs": 10,
-    "army_size": 10.1,
+WEIGHTS_BY_ACTION_TYPE = {
+    ActionType.BUILD_CITY: 10000,
+    ActionType.BUILD_SETTLEMENT: 1000,
+    ActionType.OFFER_TRADE: 500,
+    ActionType.BUY_DEVELOPMENT_CARD: 100,
 }
 
-# Change these to play around with new values
-CONTENDER_WEIGHTS = {
-    "public_vps": 300000000000001.94,
-    "production": 100000002.04188395,
-    "enemy_production": -99999998.03389844,
-    "num_tiles": 2.91440418,
-    "reachable_production_0": 2.03820085,
-    "reachable_production_1": 10002.018773150001,
-    "buildable_nodes": 1001.86278466,
-    "longest_road": 12.127388499999999,
-    "hand_synergy": 102.40606877,
-    "hand_resources": 2.43644327,
-    "discard_penalty": -3.00141993,
-    "hand_devs": 10.721669799999999,
-    "army_size": 12.93844622,
-}
+class TradeType(Enum):
+    MostForLeast       = 1
+    PortResource       = 2
+    RoadPriority       = 3
+    SettlementPriority = 4
+    CityPriority       = 5
 
+######################################################################
+# TRADE UTILITY FUNCTIONS
+######################################################################
 
-def base_fn(params=DEFAULT_WEIGHTS):
-    def fn(game, p0_color):
-        production_features = build_production_features(True)
-        our_production_sample = production_features(game, p0_color)
-        enemy_production_sample = production_features(game, p0_color)
-        production = value_production(our_production_sample, "P0")
-        enemy_production = value_production(enemy_production_sample, "P1", False)
-
-        key = player_key(game.state, p0_color)
-        longest_road_length = get_longest_road_length(game.state, p0_color)
-
-        reachability_sample = reachability_features(game, p0_color, 2)
-        features = [f"P0_0_ROAD_REACHABLE_{resource}" for resource in RESOURCES]
-        reachable_production_at_zero = sum([reachability_sample[f] for f in features])
-        features = [f"P0_1_ROAD_REACHABLE_{resource}" for resource in RESOURCES]
-        reachable_production_at_one = sum([reachability_sample[f] for f in features])
-
-        hand_sample = resource_hand_features(game, p0_color)
-        features = [f"P0_{resource}_IN_HAND" for resource in RESOURCES]
-        distance_to_city = (
-            max(2 - hand_sample["P0_WHEAT_IN_HAND"], 0)
-            + max(3 - hand_sample["P0_ORE_IN_HAND"], 0)
-        ) / 5.0  # 0 means good. 1 means bad.
-        distance_to_settlement = (
-            max(1 - hand_sample["P0_WHEAT_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_SHEEP_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_BRICK_IN_HAND"], 0)
-            + max(1 - hand_sample["P0_WOOD_IN_HAND"], 0)
-        ) / 4.0  # 0 means good. 1 means bad.
-        hand_synergy = (2 - distance_to_city - distance_to_settlement) / 2
-
-        num_in_hand = player_num_resource_cards(game.state, p0_color)
-        discard_penalty = params["discard_penalty"] if num_in_hand > 7 else 0
-
-        # blockability
-        buildings = game.state.buildings_by_color[p0_color]
-        owned_nodes = buildings[SETTLEMENT] + buildings[CITY]
-        owned_tiles = set()
-        for n in owned_nodes:
-            owned_tiles.update(game.state.board.map.adjacent_tiles[n])
-        num_tiles = len(owned_tiles)
-
-        # TODO: Simplify to linear(?)
-        num_buildable_nodes = len(game.state.board.buildable_node_ids(p0_color))
-        longest_road_factor = (
-            params["longest_road"] if num_buildable_nodes == 0 else 0.1
-        )
-
-        return float(
-            game.state.player_state[f"{key}_VICTORY_POINTS"] * params["public_vps"]
-            + production * params["production"]
-            + enemy_production * params["enemy_production"]
-            + reachable_production_at_zero * params["reachable_production_0"]
-            + reachable_production_at_one * params["reachable_production_1"]
-            + hand_synergy * params["hand_synergy"]
-            + num_buildable_nodes * params["buildable_nodes"]
-            + num_tiles * params["num_tiles"]
-            + num_in_hand * params["hand_resources"]
-            + discard_penalty
-            + longest_road_length * longest_road_factor
-            + player_num_dev_cards(game.state, p0_color) * params["hand_devs"]
-            + get_played_dev_cards(game.state, p0_color, "KNIGHT") * params["army_size"]
-        )
-
-    return fn
-
-
-def value_production(sample, player_name="P0", include_variety=True):
-    proba_point = 2.778 / 100
-    features = [
-        f"EFFECTIVE_{player_name}_WHEAT_PRODUCTION",
-        f"EFFECTIVE_{player_name}_ORE_PRODUCTION",
-        f"EFFECTIVE_{player_name}_SHEEP_PRODUCTION",
-        f"EFFECTIVE_{player_name}_WOOD_PRODUCTION",
-        f"EFFECTIVE_{player_name}_BRICK_PRODUCTION",
+def addTradeAction(self, game, playable_actions):
+    """
+    Adds a trade action to a list of playable actions. The check to ensure that the action
+    would be valid should be done before this called.
+    """
+    # Get player hand
+    hand_freqdeck = [
+        player_num_resource_cards(game.state, self.color, resource) for resource in RESOURCES
     ]
-    prod_sum = sum([sample[f] for f in features])
-    prod_variety = (
-        sum([sample[f] != 0 for f in features]) * TRANSLATE_VARIETY * proba_point
-    )
-    return prod_sum + (0 if not include_variety else prod_variety)
+
+    for flag in self.function_flags:
+        # Create list of possible trade actions
+        trade_actions = []
+
+        # Add possible trade actions per utility function
+        if flag == TradeType.MostForLeast:
+            trade_actions = createMostForLeastTrade(self, hand_freqdeck)
+        elif flag == TradeType.PortResource:
+            trade_actions = createPortResourceTrade(self, game, hand_freqdeck)
+        elif flag == TradeType.RoadPriority:
+            trade_actions = createRoadPriorityTrade(self, game, hand_freqdeck)
+        elif flag == TradeType.SettlementPriority:
+            trade_actions = createSettlementPriorityTrade(self, game, hand_freqdeck)
+        elif flag == TradeType.CityPriority:
+            trade_actions = createCityPriorityTrade(self, game, hand_freqdeck)
+
+        # If the list is not empty, add trade actions to playable actions 
+        if trade_actions:
+            playable_actions.extend(trade_actions)
+
+    return playable_actions
+    
+def createMostForLeastTrade(self, hand_freqdeck):
+    """
+    Creates a trade action the will trade the resource the player has the most of for the 
+    resource the player has the least of.
+    Function Flag to Include in Players: MostforLeast
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # Trackers for least and most resource indices and amounts
+    least_indices = []
+    least_amount = 100
+    most_indices = []
+    most_amount = -1
+
+    # Find least and most resource
+    for index, resource in enumerate(RESOURCES):
+        amount = hand_freqdeck[index]
+
+        # Check for least resource
+        if amount < least_amount:
+            least_indices = [index]
+            least_amount = amount
+        elif amount == least_amount:
+            least_indices.append(index)
+
+        # Check for most resouce
+        if amount > most_amount:
+            most_indices = [index]
+            most_amount = amount
+        elif amount == most_amount:
+            most_indices.append(index)
+
+    # Check that the player has at least one card and not all resource have the same count
+    if most_amount == 0 or most_amount == least_amount:
+        most_indices = []
+
+    # Check for valid amounts
+    if most_indices:
+        # For each combination of most index and least index
+        for most_index in most_indices:
+            for least_index in least_indices:
+
+                # Add a trade action for each value that could be traded for the most resource
+                for amount in range(1, most_amount + 1):
+                    # Create empty trade list
+                    trade_list = [0] * 10
+
+                    # Set indices in trade list to determine resources traded
+                    trade_list[most_index] = amount
+                    trade_list[least_index + 5] = amount
+
+                    # Convert list to tuple and create action
+                    trade_value = tuple(trade_list)
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createPortResourceTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action the will trade for the resource that the player owns a
+    port of.
+    Function Flag to Include in Players: PortResource
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # Trackers for resources of owned and nonowned ports
+    owned_indices = []
+    non_owned_indices = []
+
+    # Determine ports player has
+    port_resources = game.state.board.get_player_port_resources(self.color)
+
+    # Check for return value
+    if port_resources:
+        # Add indices per resource to owned ports
+        for resource in port_resources:
+            if resource == "WOOD":
+                owned_indices.append(0)
+            elif resource == "BRICK":
+                owned_indices.append(1)
+            elif resource == "SHEEP":
+                owned_indices.append(2)
+            elif resource == "WHEAT":
+                owned_indices.append(3)
+            elif resource == "ORE":
+                owned_indices.append(4)
+
+        # Check that at least one port is owned
+        if owned_indices:
+            # Put the remaining indices in the non owned list
+            for index in range(5):
+                if index not in owned_indices:
+                    non_owned_indices.append(index)
+                
+            # For each combination of most index and least index
+            for owned_index in owned_indices:
+                for non_owned_index in non_owned_indices:
+                    
+                    # Check the amount that can be traded
+                    amount = hand_freqdeck[non_owned_index]
+                    if amount > 0:
+                        # Add a trade action for each value that could be traded for the most resource
+                        for amount in range(1, amount + 1):
+                            # Create empty trade list
+                            trade_list = [0] * 10
+
+                            # Set indices in trade list to determine resources traded
+                            trade_list[non_owned_index] = amount
+                            trade_list[owned_index + 5] = amount
+
+                            # Convert list to tuple and create action
+                            trade_value = tuple(trade_list)
+                            trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createRoadPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a road
+    Function Flag to Include in Players: RoadPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+    if hand_freqdeck[0] < 1:
+        for i in range(len(hand_freqdeck)):
+            trade_value = [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+
+            # makes sure the trade isn't wood for wood
+            if i != 0:
+                # if trading brick, make sure the trade doesn't leave agent with no brick
+                if i == 1 and hand_freqdeck[1] > 1:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                elif hand_freqdeck[i] > 0:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    # generate actions for trading for wood
+    if hand_freqdeck[1] < 1:
+        for i in range(len(hand_freqdeck)):
+            trade_value = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+
+            # makes sure the trade isn't brick for brick
+            if i != 1:
+                # if trading brick, make sure the trade doesn't leave agent with no wood
+                if i == 0 and hand_freqdeck[0] > 1:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                elif hand_freqdeck[i] > 0:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createSettlementPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a settlement
+    resource the player has the least of.
+    Function Flag to Include in Players: SettlementPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+
+    # resource to gain from trade
+    for gain in range(len(hand_freqdeck)):
+        trade_value = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # checks to see if resource isn't ore and none of the resource is owned
+        if gain != 4 and hand_freqdeck[gain] < 1:
+            trade_value[4 + gain] = 1
+
+            # resource to trade away
+            for offer in range(len(hand_freqdeck)):
+
+                # checks if resource isn't ore and that at least two are owned
+                if offer != 4 and gain != offer and hand_freqdeck[offer] > 1:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is ore and at least one is owned
+                elif offer == 4 and hand_freqdeck[offer] > 0:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createCityPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a city
+    resource the player has the least of.
+    Function Flag to Include in Players: CityPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+
+    # resource to gain from trade
+    for gain in range(len(hand_freqdeck)):
+        trade_value = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # checks to see if resource is wheat and less than 2 are owned or ore and less than 3 are owned
+        if (gain == 3 and hand_freqdeck[gain] < 2) or (gain == 4 and hand_freqdeck[gain] < 3):
+            trade_value[4 + gain] = 1
+
+            # resource to trade away
+            for offer in range(len(hand_freqdeck)):
+
+                # checks if resource isn't ore and that at least one are owned
+                if offer != 3 or offer != 4 and gain != offer and hand_freqdeck[offer] > 0:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is wheat and that at least two are owned
+                elif offer == 3 and hand_freqdeck[offer] > 2:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is ore and that at least three are owned
+                elif offer == 4 and hand_freqdeck[offer] > 3:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
 
 
-def contender_fn(params):
-    return base_fn(params or CONTENDER_WEIGHTS)
+######################################################################
+# CUSTOM PLAYERS
+######################################################################
 
+# Modified ValueFunctionPlayer, it can offer trades
 
-class ValueFunctionPlayerModified(Player):
+@register_player("ValuePlayerModified") # COMMENT THIS OUT WHEN TESTING WITH DEBUGGER, WHEN USING CLI UNCOMMENT THIS
+class ValueFunctionPlayerModified(Player): 
     """
     Player that selects the move that maximizes a heuristic value function.
 
@@ -187,36 +336,41 @@ class ValueFunctionPlayerModified(Player):
         self.epsilon = epsilon
         self.traded = False
         self.tradeAttempted = False
+        
+        # Utility Functions to include for trading
+        self.function_flags = [
+            TradeType.MostForLeast,
+            TradeType.PortResource,
+            TradeType.RoadPriority,
+            # TradeType.SettlementPriority,
+            TradeType.CityPriority
+        ]
+
+    def execute_trade(self, game, enemy_color, offered, recieved):
+        # Modify players resources, minus the offered, add the received
+        player_freqdeck_add(game.state, self.color, recieved)
+        player_freqdeck_subtract(game.state, self.color, offered)
+
+        # Modify enemy resources, add the offered, minus the received
+        player_freqdeck_subtract(game.state, enemy_color, recieved)
+        player_freqdeck_add(game.state, enemy_color, offered)
 
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
             return playable_actions[0]
         
-        # TODO: Add tradeable actions
+        # Add trades to list of playable actions
         if player_has_rolled(game.state, self.color) and game.state.current_prompt == ActionPrompt.PLAY_TURN and self.traded == False:
             playable_actions = addTradeAction(self, game, playable_actions)
-        
 
-        # TODO: Iterate over each tradeable action
-        # Apply the action to the game state
-        # Get the resulting game state
-        # Get the value of the resulting game state with value_fn
-        # Save value for tradeable action
-    
-
-
+        # Random probability of choosing a random action, if enabled.
         if self.epsilon is not None and random.random() < self.epsilon:
             return random.choice(playable_actions)
 
 
-        best_value = float("-inf")
-        best_action = None
-        trade_values = []
-        for action in playable_actions: # + tradeable_actions:
+        action_values = np.zeros(len(playable_actions))
+        for i, action in enumerate(playable_actions): # + tradeable_actions:
             if action.action_type == ActionType.OFFER_TRADE:
-                # TODO: Add functionality for modifiying game state assuming the
-                # player will always accept the trade
-                print('Making a trade')
 
                 # Check which player can make the trade
                 enemy_colors = get_enemy_colors(game.state.colors, self.color)
@@ -225,58 +379,120 @@ class ValueFunctionPlayerModified(Player):
                     # Offered (0 - 4): [WOOD, BRICK, SHEEP, WHEAT, ORE]
                     # Offered (5 - 9): [WOOD, BRICK, SHEEP, WHEAT, ORE]
                     # Check if they can make the trade
-                    offered_resources   = action.values[:5]
+                    offered_resources   = action.value[:5]
                     received_resources  = action.value[5:]                   
                     can_trade = player_resource_freqdeck_contains(game.state, enemy_color, received_resources)
                     if not can_trade:
+                        action_values[i] = float('-inf')
                         continue
 
                     
                     game_copy = game.copy()
-                    # Modify players resources, minus the offered, add the received
-                    player_freqdeck_add(game_copy.state, self.color, received_resources)
-                    player_freqdeck_subtract(game_copy.state, self.color, offered_resources)
-
-                    # Modify enemy resources, add the offered, minus the received
-                    player_freqdeck_subtract(game_copy.state, enemy_color, received_resources)
-                    player_freqdeck_add(game_copy.state, enemy_color, offered_resources)
-
+                    self.execute_trade(game_copy, enemy_color, offered_resources, received_resources)
 
                     value_fn = get_value_fn(self.value_fn_builder_name, self.params)
                     value = value_fn(game_copy, self.color)
-                    trade_values.append(value)
+                    action_values[i] = value
                 
-                # TODO: Figure out how to save and compare the trade to all other actions
-                trade_values = np.array(trade_values)
-                best_idx = np.argmax(trade_values)
+
             else:
                 game_copy = game.copy()
                 game_copy.execute(action)
 
                 value_fn = get_value_fn(self.value_fn_builder_name, self.params)
                 value = value_fn(game_copy, self.color)
-                if value > best_value:
-                    best_value = value
-                    best_action = action
+                action_values[i] = value
         
+        best_idx = np.argmax(action_values)
+        best_action = playable_actions[best_idx]
+
         # Keep track of whether or not the bot has offer a trade
         if best_action.action_type == ActionType.ROLL:
             self.traded = False
         if best_action.action_type == ActionType.OFFER_TRADE:
+            print('Best action is trade')
             self.traded = True
 
         return best_action
 
     def __str__(self):
         return super().__str__() + f"(value_fn={self.value_fn_builder_name})"
+    
+# Based on RandomPlayer
+@register_player("Trader")
+class TraderBotPlayer(Player):
+    """Random AI player that selects an action randomly from the list of playable_actions.
+        Additionally has the chance to trade resource they have the most of for the resource 
+        they have the least of."""
 
+    def __init__(self, color, is_bot=True):
+        # The color of the player
+        self.color = color
+        # Whether or not the player is controlled by a bot
+        self.is_bot = is_bot
+        # Whether or not the player has traded this turn
+        self.trade_attempted = False
+        # Utility Functions to include for trading
+        self.function_flags = [
+            "MostForLeast",
+            "PortResource",
+        ]
 
-def get_value_fn(name, params, value_function=None):
-    if value_function is not None:
-        return value_function
-    elif name == "base_fn":
-        return base_fn(DEFAULT_WEIGHTS)
-    elif name == "contender_fn":
-        return contender_fn(params)
-    else:
-        raise ValueError
+    def decide(self, game, playable_actions):
+        # Add possible trade action if the player has rolled
+        if player_has_rolled(game.state, self.color) and game.state.current_prompt == ActionPrompt.PLAY_TURN and self.trade_attempted == False:
+            playable_actions = addTradeAction(self, game, playable_actions)
+
+        # Choose a random action from possible actions
+        choice = random.choice(playable_actions)
+
+        # Maintain tracker to know if player has traded this turn
+        if choice.action_type == ActionType.ROLL:
+            self.trade_attempted = False
+        if choice.action_type == ActionType.OFFER_TRADE:
+            self.trade_attempted = True
+
+        return choice
+    
+# Based on WeightedRandomPlayer
+@register_player("WeightedTrader")
+class WeightedTraderRandomPlayer(Player):
+    """
+    Player that decides at random, but skews distribution
+    to actions that are likely better (cities > settlements > dev cards).
+    """
+
+    def __init__(self, color, is_bot=True):
+        # The color of the player
+        self.color = color
+        # Whether or not the player is controlled by a bot
+        self.is_bot = is_bot
+        # Whether or not the player has traded this turn
+        self.trade_attempted = False
+        # Utility Functions to include for trading
+        self.function_flags = [
+            "MostForLeast",
+            "PortResource",
+        ]
+
+    def decide(self, game, playable_actions):
+        # Add possible trade action if the player has rolled
+        if player_has_rolled(game.state, self.color) and game.state.current_prompt == ActionPrompt.PLAY_TURN and self.trade_attempted == False:
+            playable_actions = addTradeAction(self, game, playable_actions)
+
+        # Add weights to choices 
+        bloated_actions = []
+        for action in playable_actions:
+            weight = WEIGHTS_BY_ACTION_TYPE.get(action.action_type, 1)
+            bloated_actions.extend([action] * weight)
+
+        # Choose a random action from possible weighted actions
+        choice = random.choice(bloated_actions)
+
+        # Maintain tracker to know if player has traded this turn
+        if choice.action_type == ActionType.ROLL:
+            self.trade_attempted = False
+        if choice.action_type == ActionType.OFFER_TRADE:
+            self.trade_attempted = True
+        
+        return choice
