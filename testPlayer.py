@@ -51,8 +51,14 @@ def addTradeAction(self, game, playable_actions):
             trade_actions = createMostForLeastTrade(self, hand_freqdeck)
         elif flag == "PortResource":
             trade_actions = createPortResourceTrade(self, game, hand_freqdeck)
+        elif flag == "RoadPriority":
+            trade_actions = createRoadPriorityTrade(self, game, hand_freqdeck)
+        elif flag == "SettlementPriority":
+            trade_actions = createSettlementPriorityTrade(self, game, hand_freqdeck)
+        elif flag == "CityPriority":
+            trade_actions = createCityPriorityTrade(self, game, hand_freqdeck)
 
-        # If the list is not empty, add trade actions to playable actions 
+        # If the list is not empty, add trade actions to playable actions
         if trade_actions:
             playable_actions.extend(trade_actions)
 
@@ -175,6 +181,122 @@ def createPortResourceTrade(self, game, hand_freqdeck):
                             # Convert list to tuple and create action
                             trade_value = tuple(trade_list)
                             trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+
+def createRoadPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a road
+    Function Flag to Include in Players: RoadPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+    if hand_freqdeck[0] < 1:
+        for i in enumerate(hand_freqdeck):
+            trade_value = [0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+
+            # makes sure the trade isn't wood for wood
+            if i != 0:
+                # if trading brick, make sure the trade doesn't leave agent with no brick
+                if i == 1 and hand_freqdeck[1] > 1:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                elif hand_freqdeck[i] > 0:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    # generate actions for trading for wood
+    if hand_freqdeck[1] < 1:
+        for i in enumerate(hand_freqdeck):
+            trade_value = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+
+            # makes sure the trade isn't brick for brick
+            if i != 1:
+                # if trading brick, make sure the trade doesn't leave agent with no wood
+                if i == 0 and hand_freqdeck[0] > 1:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                elif hand_freqdeck[i] > 0:
+                    trade_value[i] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createSettlementPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a settlement
+    resource the player has the least of.
+    Function Flag to Include in Players: SettlementPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+
+    # resource to gain from trade
+    for gain in enumerate(hand_freqdeck):
+        trade_value = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # checks to see if resource isn't ore and none of the resource is owned
+        if gain != 4 and hand_freqdeck[gain] < 1:
+            trade_value[4 + gain] = 1
+
+            # resource to trade away
+            for offer in enumerate(hand_freqdeck):
+
+                # checks if resource isn't ore and that at least two are owned
+                if offer != 4 and gain != offer and hand_freqdeck[offer] > 1:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is ore and at least one is owned
+                elif offer == 4 and hand_freqdeck[offer] > 0:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+    return trade_actions
+
+def createCityPriorityTrade(self, game, hand_freqdeck):
+    """
+    Creates a trade action that will trade for resources need to build a city
+    resource the player has the least of.
+    Function Flag to Include in Players: CityPriority
+    """
+    # List of possible trade actions
+    trade_actions = []
+
+    # generate actions for trading for wood
+
+    # resource to gain from trade
+    for gain in enumerate(hand_freqdeck):
+        trade_value = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # checks to see if resource is wheat and less than 2 are owned or ore and less than 3 are owned
+        if (gain == 3 and hand_freqdeck[gain] < 2) or (gain == 4 and hand_freqdeck[gain] < 3):
+            trade_value[4 + gain] = 1
+
+            # resource to trade away
+            for offer in enumerate(hand_freqdeck):
+
+                # checks if resource isn't ore and that at least one are owned
+                if offer != 3 or offer != 4 and gain != offer and hand_freqdeck[offer] > 0:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is wheat and that at least two are owned
+                elif offer == 3 and hand_freqdeck[offer] > 2:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
+
+                # checks if resource is ore and that at least three are owned
+                elif offer == 4 and hand_freqdeck[offer] > 3:
+                    trade_value[offer] = 1
+                    trade_actions.append(Action(self.color, ActionType.OFFER_TRADE, trade_value))
 
     return trade_actions
 
